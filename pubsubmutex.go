@@ -3,9 +3,8 @@ package pubsubmutex
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 // Global package-level flag for debug logging
@@ -21,6 +20,14 @@ func logDebug(format string, a ...interface{}) {
 	if debugEnabled {
 		fmt.Printf("[PUBSUB DEBUG] "+format+"\n", a...)
 	}
+}
+
+// uniqueIDCounter is used to generate unique subscriber IDs.
+var uniqueIDCounter atomic.Uint64
+
+// GetUniqueSubscriberID generates a unique subscriber ID.
+func (ps *PubSub) GetUniqueSubscriberID() string {
+	return fmt.Sprintf("sub-%d", uniqueIDCounter.Add(1))
 }
 
 // Message represents a message to be published.
@@ -41,6 +48,7 @@ type TopicConfig struct {
 // Subscriber represents a subscriber to a topic.
 type Subscriber struct {
 	ID         string         // Unique identifier for the subscriber
+	Topic      string         // The topic this subscriber is registered to
 	Ch         chan Message   // Public channel for the subscriber to receive messages
 	internalCh chan Message   // Internal buffer for messages, filled by publisher
 	close      chan struct{}  // Channel to signal closure to the delivery goroutine
@@ -100,6 +108,7 @@ func (ps *PubSub) Subscribe(topic string, subscriberID string, bufferSize int) *
 
 	sub := &Subscriber{
 		ID:         subscriberID,
+		Topic:      topic,                          // Store the topic in the Subscriber struct
 		Ch:         make(chan Message, bufferSize), // Public channel for the consumer
 		internalCh: make(chan Message, bufferSize), // Internal buffer for publishers
 		close:      make(chan struct{}),
@@ -114,27 +123,6 @@ func (ps *PubSub) Subscribe(topic string, subscriberID string, bufferSize int) *
 	return sub
 }
 
-// GetUniqueSubscriberID is a helper function that generates a unique Subscriber ID.
-func (p *PubSub) GetUniqueSubscriberID() string {
-	return uuid.New().String()
-}
-
-// SendReceive allows a message to be sent on a topic and receive a response on another topic with a timeout.
-func (p *PubSub) SendReceive(sendTopic string, receiveTopic string, sendMsg interface{}, timeoutMs int) (result interface{}) {
-	sub := p.Subscribe(receiveTopic, p.GetUniqueSubscriberID(), 1)
-	defer p.Unsubscribe(receiveTopic, sub.ID)
-	p.Publish(Message{Topic: sendTopic, Data: sendMsg})
-	select {
-	case msg, ok := <-sub.Ch:
-		if ok {
-			result = msg.Data
-		}
-	case <-time.After(time.Millisecond * time.Duration(timeoutMs)):
-		break
-	}
-	return
-}
-
 // deliverMessages is a goroutine run for each subscriber to pull messages
 // from its internal buffer and push them to its public channel.
 // This decouples the publisher from the subscriber's consumption rate.
@@ -142,7 +130,7 @@ func (s *Subscriber) deliverMessages() {
 	defer s.deliveryWg.Done() // Signal completion when this goroutine exits
 	defer close(s.Ch)         // Close the public channel when delivery stops
 
-	logDebug("Subscriber %s delivery goroutine started.", s.ID)
+	logDebug("Subscriber %s (topic '%s') delivery goroutine started.", s.ID, s.Topic)
 	for {
 		select {
 		case msg, ok := <-s.internalCh:
@@ -150,53 +138,78 @@ func (s *Subscriber) deliverMessages() {
 				// internalCh has been closed, no more messages will arrive.
 				// Drain any remaining messages in internalCh before exiting.
 				for msg := range s.internalCh {
-					logDebug("Subscriber %s draining remaining message for topic '%s' to public channel.", s.ID, msg.Topic)
+					logDebug("Subscriber %s (topic '%s') draining remaining message to public channel.", s.ID, s.Topic)
 					s.Ch <- msg // Deliver remaining messages
 				}
-				logDebug("Subscriber %s delivery goroutine exiting (internal channel closed).", s.ID)
+				logDebug("Subscriber %s (topic '%s') delivery goroutine exiting (internal channel closed).", s.ID, s.Topic)
 				return
 			}
 			// This send will block if s.Ch is full, ensuring message delivery.
-			logDebug("Subscriber %s sending message for topic '%s' to public channel.", s.ID, msg.Topic)
+			logDebug("Subscriber %s (topic '%s') sending message to public channel.", s.ID, s.Topic)
 			s.Ch <- msg
 		case <-s.close:
 			// Received signal to close. Close internalCh to allow draining
 			// and then exit the loop.
-			logDebug("Subscriber %s delivery goroutine received close signal.", s.ID)
+			logDebug("Subscriber %s (topic '%s') delivery goroutine received close signal.", s.ID, s.Topic)
 			close(s.internalCh) // Signal internalCh to close, which will trigger the !ok case above
 			return
 		}
 	}
 }
 
-// Unsubscribe removes a subscriber from a topic.
-// It gracefully stops the subscriber's delivery goroutine and closes channels.
-func (ps *PubSub) Unsubscribe(topic string, subscriberID string) {
+// CleanupSub unsubscribes a subscriber and ensures its channels are flushed to prevent deadlocks.
+func (ps *PubSub) CleanupSub(sub *Subscriber) {
+	if sub == nil {
+		return
+	}
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
-	if subs, ok := ps.subscribers[topic]; ok {
-		if sub, found := subs[subscriberID]; found {
-			logDebug("Attempting to unsubscribe subscriber '%s' from topic '%s'.", subscriberID, topic)
-			// 1. Signal the delivery goroutine to stop first.
-			close(sub.close)
+	topic := sub.Topic
+	subscriberID := sub.ID
 
-			// 2. Wait for the delivery goroutine to finish.
+	if subs, ok := ps.subscribers[topic]; ok {
+		if existingSub, found := subs[subscriberID]; found && existingSub == sub {
+			logDebug("Cleaning up subscriber '%s' from topic '%s'.", subscriberID, topic)
+			close(sub.close)
 			sub.deliveryWg.Wait()
 
-			// 3. Clean up the subscriber from the map.
+			// Explicitly drain the public channel
+			for range sub.Ch {
+				logDebug("Subscriber '%s' (topic '%s') - draining public channel during cleanup.", subscriberID, topic)
+			}
+
 			delete(subs, subscriberID)
 			if len(subs) == 0 {
 				delete(ps.subscribers, topic)
-				logDebug("Topic '%s' has no more subscribers, removing topic entry.", topic)
+				logDebug("Topic '%s' has no more subscribers after cleanup, removing topic entry.", topic)
 			}
-			logDebug("Subscriber '%s' unsubscribed successfully from topic '%s'.", subscriberID, topic)
+			logDebug("Subscriber '%s' cleaned up successfully from topic '%s'.", subscriberID, topic)
 		} else {
-			logDebug("Subscriber '%s' not found for topic '%s'.", subscriberID, topic)
+			logDebug("Subscriber '%s' not found or not the same instance for topic '%s' during cleanup.", subscriberID, topic)
 		}
 	} else {
-		logDebug("Topic '%s' not found for unsubscription.", topic)
+		logDebug("Topic '%s' not found during cleanup for subscriber '%s'.", topic, subscriberID)
 	}
+}
+
+// SendReceive subscribes to a receive topic, publishes a message to a send topic,
+// and waits for a response on the receive topic with a given timeout.
+// It uses a temporary unique subscriber ID and cleans up the subscriber afterwards.
+func (p *PubSub) SendReceive(sendTopic string, receiveTopic string, sendMsg interface{}, timeoutMs int) (result interface{}) {
+	sub := p.Subscribe(receiveTopic, p.GetUniqueSubscriberID(), 1)
+	defer p.CleanupSub(sub)
+	p.Publish(Message{Topic: sendTopic, Data: sendMsg})
+
+	select {
+	case msg, ok := <-sub.Ch:
+		if ok {
+			result = msg.Data
+		}
+	case <-time.After(time.Millisecond * time.Duration(timeoutMs)):
+		logDebug("SendReceive timeout of %dms reached for receive topic '%s'.", timeoutMs, receiveTopic)
+	}
+	return
 }
 
 // Publish sends a message to all subscribers of a specific topic.
@@ -218,19 +231,19 @@ func (ps *PubSub) Publish(message Message) {
 				select {
 				case <-s.close:
 					// Subscriber is in the process of closing, don't send message
-					logDebug("Warning: Not sending message to subscriber '%s' (topic '%s') as it's closing.", s.ID, message.Topic)
+					logDebug("Warning: Not sending message to subscriber '%s' (topic '%s') as it's closing.", s.ID, s.Topic)
 				case s.internalCh <- message:
 					// Message successfully sent to internal channel (blocking or non-blocking, depending on context)
-					logDebug("Message delivered to internal channel for subscriber '%s' on topic '%s'.", s.ID, message.Topic)
+					logDebug("Message delivered to internal channel for subscriber '%s' on topic '%s'.", s.ID, s.Topic)
 				default:
 					if topicConfig.AllowDropping {
 						// Only hit this default if AllowDropping is true AND the channel is full
-						logDebug("Warning: Dropping message for subscriber '%s' on topic '%s' (channel full, dropping allowed).", s.ID, message.Topic)
+						logDebug("Warning: Dropping message for subscriber '%s' on topic '%s' (channel full, dropping allowed).", s.ID, s.Topic)
 					} else {
 						// This branch should ideally not be hit if AllowDropping is false,
 						// as the blocking send case `s.internalCh <- message` should take precedence.
 						// It's a fallback for unexpected scenarios.
-						logDebug("Error: Unexpected message drop for subscriber '%s' on topic '%s' (dropping not allowed, channel full). This indicates a logic error or extreme saturation.", s.ID, message.Topic)
+						logDebug("Error: Unexpected message drop for subscriber '%s' on topic '%s' (dropping not allowed, channel full). This indicates a logic error or extreme saturation.", s.ID, s.Topic)
 					}
 				}
 			}(sub)
@@ -270,10 +283,10 @@ func (ps *PubSub) Close() {
 // It runs in a goroutine and continuously reads from the subscriber's channel
 // until the channel is closed.
 func (s *Subscriber) ReadMessages(handler func(Message)) {
-	logDebug("Subscriber %s consumer goroutine started.", s.ID)
+	logDebug("Subscriber %s (topic '%s') consumer goroutine started.", s.ID, s.Topic)
 	for msg := range s.Ch { // This loop will exit when s.Ch is closed
-		logDebug("Subscriber %s calling handler for message on topic '%s'.", s.ID, msg.Topic)
+		logDebug("Subscriber %s (topic '%s') calling handler.", s.ID, s.Topic)
 		handler(msg)
 	}
-	logDebug("Subscriber %s consumer goroutine exiting.", s.ID)
+	logDebug("Subscriber %s (topic '%s') consumer goroutine exiting.", s.ID, s.Topic)
 }

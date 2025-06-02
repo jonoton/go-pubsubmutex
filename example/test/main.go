@@ -65,7 +65,7 @@ func main() {
 	fmt.Println("Main: Finished publishing to 'sports'.")
 
 	fmt.Println("\n--- Unsubscribing sub1 ---")
-	ps.Unsubscribe("news", "sub1")
+	ps.CleanupSub(sub1)
 
 	fmt.Println("\n--- Publishing more to 'news' ---")
 	ps.Publish(pubsub.Message{Topic: "news", Data: "News after unsubscribe"})
