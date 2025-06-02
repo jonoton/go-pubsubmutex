@@ -162,6 +162,13 @@ func (ps *PubSub) CleanupSub(sub *Subscriber) {
 	if sub == nil {
 		return
 	}
+	go func(s *Subscriber) {
+		logDebug("Subscriber '%s' (topic '%s') - starting goroutine to drain public channel.", sub.ID, sub.Topic)
+		for range s.Ch {
+			logDebug("Subscriber '%s' (topic '%s') - reading from public channel during cleanup.", sub.ID, sub.Topic)
+		}
+		logDebug("Subscriber '%s' (topic '%s') - finished draining public channel.", sub.ID, sub.Topic)
+	}(sub)
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
@@ -173,12 +180,6 @@ func (ps *PubSub) CleanupSub(sub *Subscriber) {
 			logDebug("Cleaning up subscriber '%s' from topic '%s'.", subscriberID, topic)
 			close(sub.close)
 			sub.deliveryWg.Wait()
-
-			// Explicitly drain the public channel
-			for range sub.Ch {
-				logDebug("Subscriber '%s' (topic '%s') - draining public channel during cleanup.", subscriberID, topic)
-			}
-
 			delete(subs, subscriberID)
 			if len(subs) == 0 {
 				delete(ps.subscribers, topic)
