@@ -618,59 +618,59 @@ func TestClose(t *testing.T) {
 }
 
 // TestConcurrentSubscribeUnsubscribe ensures concurrency safety.
-// func TestConcurrentSubscribeUnsubscribe(t *testing.T) {
-// 	// This test can be flaky due to its high concurrency and short sleeps.
-// 	// It's primarily a race condition detector.
-// 	// Consider running with -race flag.
-// 	t.Parallel() // Allow this test to run in parallel with others
+func TestConcurrentSubscribeUnsubscribe(t *testing.T) {
+	// This test can be flaky due to its high concurrency and short sleeps.
+	// It's primarily a race condition detector.
+	// Consider running with -race flag.
+	t.Parallel() // Allow this test to run in parallel with others
 
-// 	ps := NewPubSub()
-// 	defer ps.Close()
+	ps := NewPubSub()
+	defer ps.Close()
 
-// 	topic := "concurrent_topic_stress"
-// 	numGoroutines := 5           // Number of concurrent actors
-// 	iterationsPerGoroutine := 10 // Number of subscribe/publish/cleanup cycles per actor
+	topic := "concurrent_topic_stress"
+	numGoroutines := 5           // Number of concurrent actors
+	iterationsPerGoroutine := 10 // Number of subscribe/publish/cleanup cycles per actor
 
-// 	var stressWg sync.WaitGroup
-// 	for i := 0; i < numGoroutines; i++ {
-// 		stressWg.Add(1)
-// 		go func(goroutineID int) {
-// 			defer stressWg.Done()
-// 			subIDBase := fmt.Sprintf("g%d-sub", goroutineID)
-// 			for j := 0; j < iterationsPerGoroutine; j++ {
-// 				currentSubID := fmt.Sprintf("%s-iter%d", subIDBase, j)
-// 				sub := ps.Subscribe(topic, currentSubID, 2) // Small buffer
-// 				if sub == nil {
-// 					// This might happen if another goroutine just subscribed with the exact same ID in a tiny window.
-// 					// Or if Subscribe has an issue. For this test, log it and continue.
-// 					t.Logf("Goroutine %d, Iter %d: Subscribe for %s returned nil", goroutineID, j, currentSubID)
-// 					continue
-// 				}
+	var stressWg sync.WaitGroup
+	for i := 0; i < numGoroutines; i++ {
+		stressWg.Add(1)
+		go func(goroutineID int) {
+			defer stressWg.Done()
+			subIDBase := fmt.Sprintf("g%d-sub", goroutineID)
+			for j := 0; j < iterationsPerGoroutine; j++ {
+				currentSubID := fmt.Sprintf("%s-iter%d", subIDBase, j)
+				sub := ps.Subscribe(topic, currentSubID, 2) // Small buffer
+				if sub == nil {
+					// This might happen if another goroutine just subscribed with the exact same ID in a tiny window.
+					// Or if Subscribe has an issue. For this test, log it and continue.
+					t.Logf("Goroutine %d, Iter %d: Subscribe for %s returned nil", goroutineID, j, currentSubID)
+					continue
+				}
 
-// 				// Do some work with the subscriber
-// 				ps.Publish(Message{Topic: topic, Data: fmt.Sprintf("Msg from %s", currentSubID)})
+				// Do some work with the subscriber
+				ps.Publish(Message{Topic: topic, Data: fmt.Sprintf("Msg from %s", currentSubID)})
 
-// 				// Attempt to read, but don't block test if message is missed due to timing.
-// 				// The main purpose is to stress subscribe/cleanup.
-// 				msgReceived := false
-// 				select {
-// 				case _, ok := <-sub.Ch:
-// 					if ok {
-// 						msgReceived = true
-// 					}
-// 				case <-time.After(20 * time.Millisecond): // Short timeout
-// 					// Message might be missed, or sub might be cleaned up quickly
-// 				}
-// 				_ = msgReceived // Use variable to avoid lint error
+				// Attempt to read, but don't block test if message is missed due to timing.
+				// The main purpose is to stress subscribe/cleanup.
+				msgReceived := false
+				select {
+				case _, ok := <-sub.Ch:
+					if ok {
+						msgReceived = true
+					}
+				case <-time.After(20 * time.Millisecond): // Short timeout
+					// Message might be missed, or sub might be cleaned up quickly
+				}
+				_ = msgReceived // Use variable to avoid lint error
 
-// 				ps.CleanupSub(sub)
-// 				// time.Sleep(time.Duration(rand.Intn(5)) * time.Millisecond) // Optional small random delay
-// 			}
-// 		}(i)
-// 	}
-// 	stressWg.Wait()
-// 	t.Log("Concurrent subscribe/unsubscribe stress test completed.")
-// }
+				ps.CleanupSub(sub)
+				// time.Sleep(time.Duration(rand.Intn(5)) * time.Millisecond) // Optional small random delay
+			}
+		}(i)
+	}
+	stressWg.Wait()
+	t.Log("Concurrent subscribe/unsubscribe stress test completed.")
+}
 
 // TestConcurrentPublish ensures no deadlocks or races during high publish volume.
 func TestConcurrentPublish(t *testing.T) {
