@@ -8,7 +8,7 @@ being directly coupled.
 [![Go Reference](https://pkg.go.dev/badge/github.com/jonoton/go-pubsubmutex.svg)](https://pkg.go.dev/github.com/jonoton/go-pubsubmutex)
 [![Go Report Card](https://goreportcard.com/badge/github.com/jonoton/go-pubsubmutex?)](https://goreportcard.com/report/github.com/jonoton/go-pubsubmutex)
 
-# Key Features
+## Key Features
 
   - **Thread Safety:** All operations on the PubSub system, such as subscribing,
     publishing, and unsubscribing, are safe for concurrent use by multiple goroutines.
@@ -34,11 +34,11 @@ being directly coupled.
     using the Close() method, which ensures all active subscribers are unsubscribed
     and their resources are released.
 
-# Usage Examples
+## Usage Examples
 
 Here are some examples demonstrating how to use the package.
 
-## Initialization and Subscribing
+### Initialization and Subscribing
 
 First, create a new PubSub system instance and subscribe to a topic. The `Subscribe`
 method returns a `Subscriber` instance, which contains the channel you will use
@@ -59,7 +59,7 @@ if sub1 == nil {
 fmt.Printf("Successfully subscribed '%s' to topic '%s'.\n", sub1.ID, sub1.Topic)
 ```
 
-## Publishing and Receiving Messages
+### Publishing and Receiving Messages
 
 Publish messages to a topic using `ps.Publish()`. To receive them, read from the
 `Ch` channel on your `Subscriber` instance. It's common to do this in a separate goroutine.
@@ -84,7 +84,7 @@ ps.Publish(pubsubmutex.Message{Topic: "news.weather", Data: "This message will n
 ps.Publish(pubsubmutex.Message{Topic: "news.sports", Data: "A great match happened today."})
 ```
 
-## Self-Unsubscribing
+### Self-Unsubscribing
 
 A subscriber can clean itself up by calling its `Unsubscribe()` method. This is often
 done based on some condition, like receiving a specific message.
