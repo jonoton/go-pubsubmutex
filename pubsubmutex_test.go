@@ -722,39 +722,39 @@ func TestConcurrentPublish(t *testing.T) {
 }
 
 func TestReadMessages(t *testing.T) {
-    ps := NewPubSub()
-    defer ps.Close()
+	ps := NewPubSub()
+	defer ps.Close()
 
-    // Create a subscriber that listens on "test_topic"
-    subID := "test_subscriber"
-    sub := ps.Subscribe("test_topic", subID, 1)
-    if sub == nil {
-        t.Fatalf("Failed to subscribe sub")
-    }
-    defer ps.CleanupSub(sub) // Ensure sub is cleaned up
+	// Create a subscriber that listens on "test_topic"
+	subID := "test_subscriber"
+	sub := ps.Subscribe("test_topic", subID, 1)
+	if sub == nil {
+		t.Fatalf("Failed to subscribe sub")
+	}
+	defer ps.CleanupSub(sub) // Ensure sub is cleaned up
 
-    // Create a channel to signal when the message is received
-    msgReceived := make(chan struct{})
+	// Create a channel to signal when the message is received
+	msgReceived := make(chan struct{})
 
-    // Start ReadMessages in a goroutine and use a channel to signal when it's done
-    var receivedMessages []Message
-    go func() {
-        sub.ReadMessages(func(msg Message) {
-            receivedMessages = append(receivedMessages, msg)
-            close(msgReceived) // Signal that the message has been received
-        })
-    }()
+	// Start ReadMessages in a goroutine and use a channel to signal when it's done
+	var receivedMessages []Message
+	go func() {
+		sub.ReadMessages(func(msg Message) {
+			receivedMessages = append(receivedMessages, msg)
+			close(msgReceived) // Signal that the message has been received
+		})
+	}()
 
-    // Publish a message to the topic
-    ps.Publish(Message{Topic: "test_topic", Data: "Test Message"})
+	// Publish a message to the topic
+	ps.Publish(Message{Topic: "test_topic", Data: "Test Message"})
 
-    // Wait for the message to be processed
-    <-msgReceived
+	// Wait for the message to be processed
+	<-msgReceived
 
-    if len(receivedMessages) != 1 {
-        t.Errorf("Expected 1 message, got %d", len(receivedMessages))
-    }
-    if receivedMessages[0].Data != "Test Message" {
-        t.Errorf("Expected message data 'Test Message', got '%v'", receivedMessages[0].Data)
-    }
+	if len(receivedMessages) != 1 {
+		t.Errorf("Expected 1 message, got %d", len(receivedMessages))
+	}
+	if receivedMessages[0].Data != "Test Message" {
+		t.Errorf("Expected message data 'Test Message', got '%v'", receivedMessages[0].Data)
+	}
 }
