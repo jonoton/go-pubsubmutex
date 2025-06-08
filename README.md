@@ -44,67 +44,73 @@ First, create a new PubSub system instance and subscribe to a topic. The `Subscr
 method returns a `Subscriber` instance, which contains the channel you will use
 to receive messages.
 
-	// Create a new PubSub system.
-	ps := pubsubmutex.NewPubSub()
-	defer ps.Close() // Best practice to defer Close().
+```go
+// Create a new PubSub system.
+ps := pubsubmutex.NewPubSub()
+defer ps.Close() // Best practice to defer Close().
 
-	// Subscribe to a topic with a unique subscriber ID and a buffer size of 10.
-	sub1 := ps.Subscribe("news.sports", "subscriber-1", 10)
-	if sub1 == nil {
-		fmt.Println("Failed to subscribe")
-		return
-	}
+// Subscribe to a topic with a unique subscriber ID and a buffer size of 10.
+sub1 := ps.Subscribe("news.sports", "subscriber-1", 10)
+if sub1 == nil {
+	fmt.Println("Failed to subscribe")
+	return
+}
 
-	fmt.Printf("Successfully subscribed '%s' to topic '%s'.\n", sub1.ID, sub1.Topic)
+fmt.Printf("Successfully subscribed '%s' to topic '%s'.\n", sub1.ID, sub1.Topic)
+```
 
 ## Publishing and Receiving Messages
 
 Publish messages to a topic using `ps.Publish()`. To receive them, read from the
 `Ch` channel on your `Subscriber` instance. It's common to do this in a separate goroutine.
 
-	// Assumes 'ps' and 'sub1' exist from the previous example.
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		fmt.Println("Subscriber 1 waiting for messages...")
-		for msg := range sub1.Ch {
-			fmt.Printf("Subscriber 1 received: Topic='%s', Data='%v'\n", msg.Topic, msg.Data)
-		}
-		// The loop will exit when sub1.Ch is closed (e.g., by unsubscribing).
-		fmt.Println("Subscriber 1 message channel closed.")
-	}()
+```go
+// Assumes 'ps' and 'sub1' exist from the previous example.
+var wg sync.WaitGroup
+wg.Add(1)
+go func() {
+	defer wg.Done()
+	fmt.Println("Subscriber 1 waiting for messages...")
+	for msg := range sub1.Ch {
+		fmt.Printf("Subscriber 1 received: Topic='%s', Data='%v'\n", msg.Topic, msg.Data)
+	}
+	// The loop will exit when sub1.Ch is closed (e.g., by unsubscribing).
+	fmt.Println("Subscriber 1 message channel closed.")
+}()
 
-	// Publish messages to the topic.
-	ps.Publish(pubsubmutex.Message{Topic: "news.sports", Data: "Welcome to sports news!"})
-	ps.Publish(pubsubmutex.Message{Topic: "news.weather", Data: "This message will not be received by sub1."})
-	ps.Publish(pubsubmutex.Message{Topic: "news.sports", Data: "A great match happened today."})
+// Publish messages to the topic.
+ps.Publish(pubsubmutex.Message{Topic: "news.sports", Data: "Welcome to sports news!"})
+ps.Publish(pubsubmutex.Message{Topic: "news.weather", Data: "This message will not be received by sub1."})
+ps.Publish(pubsubmutex.Message{Topic: "news.sports", Data: "A great match happened today."})
+```
 
 ## Self-Unsubscribing
 
 A subscriber can clean itself up by calling its `Unsubscribe()` method. This is often
 done based on some condition, like receiving a specific message.
 
-	ps := pubsubmutex.NewPubSub()
-	defer ps.Close()
+```go
+ps := pubsubmutex.NewPubSub()
+defer ps.Close()
 
-	var wg sync.WaitGroup
-	sub := ps.Subscribe("commands", "worker-1", 5)
+var wg sync.WaitGroup
+sub := ps.Subscribe("commands", "worker-1", 5)
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for msg := range sub.Ch {
-			fmt.Printf("Worker received command: %v\n", msg.Data)
-			if msg.Data == "stop" {
-				fmt.Println("Stop command received. Unsubscribing...")
-				sub.Unsubscribe() // Subscriber triggers its own cleanup.
-			}
+wg.Add(1)
+go func() {
+	defer wg.Done()
+	for msg := range sub.Ch {
+		fmt.Printf("Worker received command: %v\n", msg.Data)
+		if msg.Data == "stop" {
+			fmt.Println("Stop command received. Unsubscribing...")
+			sub.Unsubscribe() // Subscriber triggers its own cleanup.
 		}
-		fmt.Println("Worker message loop exited.")
-	}()
+	}
+	fmt.Println("Worker message loop exited.")
+}()
 
-	ps.Publish(pubsubmutex.Message{Topic: "commands", Data: "start processing"})
-	ps.Publish(pubsubmutex.Message{Topic: "commands", Data: "stop"})
+ps.Publish(pubsubmutex.Message{Topic: "commands", Data: "start processing"})
+ps.Publish(pubsubmutex.Message{Topic: "commands", Data: "stop"})
 
-	wg.Wait() // Wait for the worker goroutine to finish.
+wg.Wait() // Wait for the worker goroutine to finish.
+```
