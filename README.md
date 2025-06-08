@@ -30,6 +30,12 @@ being directly coupled.
     holding a Subscriber instance can call its Unsubscribe() method to cleanly
     remove itself from the PubSub system.
 
+  - **Automatic Resource Cleanup:** If a message's `Data` field implements the `Cleanable`
+    interface (with a `Cleanup()` method), `Cleanup()` will be called automatically
+    if the message is dropped. This occurs if a subscriber's buffer is full, a
+    publish times out, the subscriber is closing, or if there are no subscribers
+    for the topic at all. This prevents resource leaks.
+
   - **Graceful Shutdown:** The entire PubSub system can be shut down gracefully
     using the Close() method, which ensures all active subscribers are unsubscribed
     and their resources are released.
@@ -113,4 +119,40 @@ ps.Publish(pubsubmutex.Message{Topic: "commands", Data: "start processing"})
 ps.Publish(pubsubmutex.Message{Topic: "commands", Data: "stop"})
 
 wg.Wait() // Wait for the worker goroutine to finish.
+```
+
+### Automatic Cleanup of Dropped Messages
+
+If a message's payload needs to have resources freed (e.g., closing a file handle),
+you can implement the `Cleanable` interface. Its `Cleanup()` method will be called
+if the message is dropped.
+
+```go
+// Define a type that holds a resource.
+type ResourcefulMessage struct {
+	ID       int
+	resource string // In a real scenario, this might be a file handle, etc.
+}
+
+// Implement the Cleanable interface.
+func (rm *ResourcefulMessage) Cleanup() {
+	fmt.Printf("Cleaning up resource for message ID: %d\n", rm.ID)
+	// Here you would close the file handle, network connection, etc.
+}
+
+// ... later in the code ...
+
+// This topic is configured to drop messages immediately if the buffer is full.
+ps.CreateTopic("resource.topic", pubsubmutex.TopicConfig{AllowDropping: true})
+
+// Subscriber with a small buffer that is not reading messages, causing it to fill up.
+sub := ps.Subscribe("resource.topic", "resource-worker", 1)
+
+// Publish two messages. The first will fill the buffer. The second will be dropped.
+// The Cleanup() method for the second message will be called automatically.
+ps.Publish(pubsubmutex.Message{Topic: "resource.topic", Data: &ResourcefulMessage{ID: 1, resource: "active"}})
+ps.Publish(pubsubmutex.Message{Topic: "resource.topic", Data: &ResourcefulMessage{ID: 2, resource: "active"}})
+
+// Output will include:
+// Cleaning up resource for message ID: 2
 ```

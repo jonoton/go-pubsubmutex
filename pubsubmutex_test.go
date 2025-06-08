@@ -758,3 +758,171 @@ func TestReadMessages(t *testing.T) {
 		t.Errorf("Expected message data 'Test Message', got '%v'", receivedMessages[0].Data)
 	}
 }
+
+// -----------------------------------------------------------------------------
+// Tests for Cleanable Interface
+// -----------------------------------------------------------------------------
+
+// cleanableResource is a helper struct for testing the Cleanable interface.
+type cleanableResource struct {
+	ID        int
+	cleanedUp atomic.Bool
+}
+
+// Cleanup implements the Cleanable interface.
+func (cr *cleanableResource) Cleanup() {
+	cr.cleanedUp.Store(true)
+	logDebug("Cleanup called for resource ID: %d", cr.ID)
+}
+
+// WasCleaned checks if the Cleanup method was called.
+func (cr *cleanableResource) WasCleaned() bool {
+	return cr.cleanedUp.Load()
+}
+
+// TestCleanable_MessageDropped_FullBuffer tests that Cleanup is called when a message is dropped due to a full buffer.
+func TestCleanable_MessageDropped_FullBuffer(t *testing.T) {
+	ps := NewPubSub()
+	defer ps.Close()
+
+	topic := "cleanable-drop-topic"
+	ps.CreateTopic(topic, TopicConfig{AllowDropping: true})
+
+	sub := ps.Subscribe(topic, "resource-worker", 1)
+	if sub == nil {
+		t.Fatal("Failed to subscribe")
+	}
+
+	msg1Data := &cleanableResource{ID: 1}
+	ps.Publish(Message{Topic: topic, Data: msg1Data})
+
+	msg2Data := &cleanableResource{ID: 2}
+	ps.Publish(Message{Topic: topic, Data: msg2Data})
+
+	time.Sleep(100 * time.Millisecond)
+
+	if msg1Data.WasCleaned() {
+		t.Error("Message 1 should not have been cleaned up, but it was.")
+	}
+
+	if !msg2Data.WasCleaned() {
+		t.Error("Message 2 should have been cleaned up because it was dropped, but it wasn't.")
+	} else {
+		t.Log("Successfully cleaned up message dropped due to full buffer.")
+	}
+}
+
+// TestCleanable_MessageDropped_Timeout tests that Cleanup is called when a publish times out.
+func TestCleanable_MessageDropped_Timeout(t *testing.T) {
+	ps := NewPubSub()
+	defer ps.Close()
+
+	topic := "cleanable-timeout-topic"
+	timeoutDuration := 100 * time.Millisecond
+	ps.CreateTopic(topic, TopicConfig{AllowDropping: false, PublishTimeout: timeoutDuration})
+
+	sub := ps.Subscribe(topic, "resource-worker", 1)
+	if sub == nil {
+		t.Fatal("Failed to subscribe")
+	}
+
+	ps.Publish(Message{Topic: topic, Data: &cleanableResource{ID: 1}})
+	time.Sleep(20 * time.Millisecond)
+	msg2Data := &cleanableResource{ID: 2}
+	ps.Publish(Message{Topic: topic, Data: msg2Data})
+	msg3Data := &cleanableResource{ID: 3}
+	ps.Publish(Message{Topic: topic, Data: msg3Data})
+
+	time.Sleep(50 * time.Millisecond)
+
+	if msg2Data.WasCleaned() {
+		t.Error("Message 2 should not have been cleaned up, but it was.")
+	}
+
+	if !msg3Data.WasCleaned() {
+		t.Error("Message 3 should have been cleaned up due to publish timeout, but it wasn't.")
+	} else {
+		t.Log("Successfully cleaned up message dropped due to publish timeout.")
+	}
+}
+
+// TestCleanable_MessageDropped_NoSubscribers tests that Cleanup is called when there are no subscribers.
+func TestCleanable_MessageDropped_NoSubscribers(t *testing.T) {
+	ps := NewPubSub()
+	defer ps.Close()
+
+	topic := "cleanable-no-subs-topic"
+	msgData := &cleanableResource{ID: 1}
+
+	ps.Publish(Message{Topic: topic, Data: msgData})
+	time.Sleep(50 * time.Millisecond)
+
+	if !msgData.WasCleaned() {
+		t.Error("Message should have been cleaned up when published to a topic with no subscribers, but it wasn't.")
+	} else {
+		t.Log("Successfully cleaned up message published to a topic with no subscribers.")
+	}
+}
+
+// TestCleanable_MessageCleanedOnSubscriberCleanup tests that Cleanup is called for buffered messages when a subscriber is removed.
+func TestCleanable_MessageCleanedOnSubscriberCleanup(t *testing.T) {
+	ps := NewPubSub()
+	defer ps.Close()
+
+	topic := "cleanable-sub-cleanup-topic"
+	sub := ps.Subscribe(topic, "worker", 5)
+	if sub == nil {
+		t.Fatal("Failed to subscribe")
+	}
+
+	msg1Data := &cleanableResource{ID: 1}
+	msg2Data := &cleanableResource{ID: 2}
+
+	ps.Publish(Message{Topic: topic, Data: msg1Data})
+	ps.Publish(Message{Topic: topic, Data: msg2Data})
+	time.Sleep(50 * time.Millisecond)
+
+	sub.Unsubscribe()
+
+	if !msg1Data.WasCleaned() {
+		t.Errorf("Message 1 should have been cleaned up during subscriber cleanup, but it wasn't.")
+	}
+	if !msg2Data.WasCleaned() {
+		t.Errorf("Message 2 should have been cleaned up during subscriber cleanup, but it wasn't.")
+	}
+	t.Log("Successfully cleaned up buffered messages during subscriber cleanup.")
+}
+
+// TestCleanable_MessageNotCleanedWhenDelivered tests that Cleanup is NOT called for a successfully delivered message.
+func TestCleanable_MessageNotCleanedWhenDelivered(t *testing.T) {
+	ps := NewPubSub()
+	defer ps.Close()
+
+	topic := "cleanable-success-topic"
+	sub := ps.Subscribe(topic, "worker", 5)
+	if sub == nil {
+		t.Fatal("Failed to subscribe")
+	}
+
+	msgData := &cleanableResource{ID: 1}
+	done := make(chan struct{})
+
+	go func() {
+		<-sub.Ch // Read one message.
+		close(done)
+	}()
+
+	ps.Publish(Message{Topic: topic, Data: msgData})
+
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("Timed out waiting for message to be consumed.")
+	}
+
+	if msgData.WasCleaned() {
+		t.Error("Message was cleaned up even though it was successfully delivered.")
+	} else {
+		t.Log("Successfully verified that delivered message was not cleaned up.")
+	}
+}
