@@ -179,6 +179,14 @@ func (s *Subscriber) Unsubscribe() {
 	}
 }
 
+// Cleanup makes Subscriber implement the Cleanable interface. If a message containing
+// a subscriber as its Data is dropped, this method will be called, triggering the
+// subscriber's unsubscription process.
+func (s *Subscriber) Cleanup() {
+	logDebug("Cleanup() called for subscriber %s, calling Unsubscribe().", s.ID)
+	s.Unsubscribe()
+}
+
 // deliverMessages is an internal goroutine run for each subscriber.
 func (s *Subscriber) deliverMessages() {
 	defer s.deliveryWg.Done()
