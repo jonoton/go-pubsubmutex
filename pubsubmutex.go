@@ -7,12 +7,11 @@ import (
 	"time"
 )
 
-// Cleanable is an interface for objects that need explicit resource management.
-// If a message's Data field implements this interface, its Cleanup() method
-// will be called automatically when the message is dropped (e.g., due to a full
-// buffer, a publish timeout, or a closing subscriber). This helps prevent
-// resource leaks for data that isn't delivered.
-type Cleanable interface {
+// ManagedItem is an optional generic interface for message data that requires
+// reference counting and explicit cleanup. The generic type T ensures that
+// Ref() returns the concrete type of the data.
+type ManagedItem[T any] interface {
+	Ref() T
 	Cleanup()
 }
 
@@ -34,82 +33,86 @@ func logDebug(format string, a ...interface{}) {
 // uniqueIDCounter is used to generate unique subscriber IDs.
 var uniqueIDCounter atomic.Uint64
 
-// GetUniqueSubscriberID generates a new unique subscriber ID.
-func (ps *PubSub) GetUniqueSubscriberID() string {
-	return fmt.Sprintf("sub-%d", uniqueIDCounter.Add(1))
-}
-
-// Message represents a message to be published. It contains the topic the
-// message is for and the actual data.
-type Message struct {
+// Message represents a message to be published. It is generic over the type
+// of its data payload.
+type Message[T any] struct {
 	Topic string
-	Data  interface{}
+	Data  T
 }
 
-// DefaultPublishTimeout is the default duration a publisher will wait
-// for a message to be accepted by a subscriber's internal buffer if
-// the topic is configured for blocking sends (AllowDropping=false)
-// and no specific TopicConfig overrides this for the topic.
+// DefaultPublishTimeout is the default duration a publisher will wait.
 const DefaultPublishTimeout = 500 * time.Millisecond
 
 // TopicConfig allows configuring behavior for a specific topic.
 type TopicConfig struct {
-	// AllowDropping, if true, means messages published to this topic
-	// might be dropped if a subscriber's internal buffer is full.
-	// If false (default), publishing will block until the message is accepted
-	// by the subscriber's internal buffer or a timeout occurs.
-	AllowDropping bool
-	// PublishTimeout specifies the maximum time a publisher will wait
-	// for a message to be accepted by a subscriber's internal buffer
-	// if AllowDropping is false. A value of 0 means no timeout (publisher
-	// will block indefinitely).
+	AllowDropping  bool
 	PublishTimeout time.Duration
 }
 
-// Subscriber represents a client subscribed to a topic. It provides a channel (Ch)
-// for receiving messages and can manage its own unsubscription.
-type Subscriber struct {
-	ID                string         // Unique identifier for the subscriber.
-	Topic             string         // The topic this subscriber is registered to.
-	Ch                chan Message   // Public channel for the client to receive messages.
-	internalCh        chan Message   // Internal buffered channel where messages are first queued.
-	close             chan struct{}  // Signals the internal delivery goroutine to shut down.
-	shutdownOnce      sync.Once      // Ensures the shutdown signal (closing s.close) happens only once.
-	deliveryWg        sync.WaitGroup // Waits for the message delivery goroutine to complete.
-	internalCloseOnce sync.Once      // Ensures s.internalCh is closed only once.
-	unsubscribeFunc   func()         // Callback provided by PubSub to initiate this subscriber's cleanup.
-	unsubscribed      atomic.Bool    // Tracks if Unsubscribe has been called, for idempotency.
+// Subscriber represents a client subscribed to a topic. It is generic over
+// the type of data it receives.
+type Subscriber[T any] struct {
+	ID                string
+	Topic             string
+	Ch                chan Message[T]
+	internalCh        chan Message[T]
+	close             chan struct{}
+	shutdownOnce      sync.Once
+	deliveryWg        sync.WaitGroup
+	internalCloseOnce sync.Once
+	unsubscribeFunc   func()
+	unsubscribed      atomic.Bool
 }
 
-// PubSub represents the core publish-subscribe system. It manages topics,
-// subscribers, and message dispatching.
-type PubSub struct {
+// Unsubscribe signals the PubSub system to remove and clean up this subscriber instance.
+func (s *Subscriber[T]) Unsubscribe() {
+	if s.unsubscribed.CompareAndSwap(false, true) {
+		if s.unsubscribeFunc != nil {
+			s.unsubscribeFunc()
+		}
+	}
+}
+
+// ReadMessages is a helper function for clients to continuously read messages.
+func (s *Subscriber[T]) ReadMessages(handler func(Message[T])) {
+	logDebug("Subscriber %s: ReadMessages loop started.", s.ID)
+	for msg := range s.Ch {
+		handler(msg)
+	}
+	logDebug("Subscriber %s: ReadMessages loop exited.", s.ID)
+}
+
+// pubSubCore is an interface for the internal, non-generic methods of a basePubSub.
+type pubSubCore interface {
+	updateTopic(topic string, config TopicConfig)
+	close()
+}
+
+// basePubSub represents the internal, core publish-subscribe system. It is generic
+// over the type of data it handles and is not intended for direct use.
+type basePubSub[T any] struct {
 	mu           sync.RWMutex
-	subscribers  map[string]map[string]*Subscriber
+	subscribers  map[string]map[string]*Subscriber[T]
 	topicConfigs map[string]TopicConfig
 }
 
-// NewPubSub creates and returns a new PubSub system instance.
-func NewPubSub() *PubSub {
-	ps := &PubSub{
-		subscribers:  make(map[string]map[string]*Subscriber),
+// newBasePubSub creates a new internal generic PubSub system instance.
+func newBasePubSub[T any]() *basePubSub[T] {
+	ps := &basePubSub[T]{
+		subscribers:  make(map[string]map[string]*Subscriber[T]),
 		topicConfigs: make(map[string]TopicConfig),
 	}
-	logDebug("New PubSub system created.")
+	logDebug("New basePubSub system created for type %T.", *new(T))
 	return ps
 }
 
-// CreateTopic explicitly creates and configures a topic with specific behaviors.
-// If a topic is published to without being explicitly created, it will use default configurations.
-func (ps *PubSub) CreateTopic(topic string, config TopicConfig) {
+func (ps *basePubSub[T]) updateTopic(topic string, config TopicConfig) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 	ps.topicConfigs[topic] = config
-	logDebug("Topic '%s' created with config: %+v", topic, config)
 }
 
-// getTopicConfig retrieves the configuration for a given topic.
-func (ps *PubSub) getTopicConfig(topic string) TopicConfig {
+func (ps *basePubSub[T]) getTopicConfig(topic string) TopicConfig {
 	ps.mu.RLock()
 	defer ps.mu.RUnlock()
 	if config, ok := ps.topicConfigs[topic]; ok {
@@ -118,10 +121,7 @@ func (ps *PubSub) getTopicConfig(topic string) TopicConfig {
 	return TopicConfig{AllowDropping: false, PublishTimeout: DefaultPublishTimeout}
 }
 
-// Subscribe allows a client to register for messages on a specific topic.
-// It returns a new Subscriber instance. The subscriberID must be unique for the given topic.
-// bufferSize determines the capacity of the internal message buffer for this subscriber.
-func (ps *PubSub) Subscribe(topic string, subscriberID string, bufferSize int) *Subscriber {
+func (ps *basePubSub[T]) subscribe(topic string, subscriberID string, bufferSize int) *Subscriber[T] {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
@@ -129,320 +129,361 @@ func (ps *PubSub) Subscribe(topic string, subscriberID string, bufferSize int) *
 		bufferSize = 0
 	}
 
-	var newTopicMapCreated bool
 	if _, ok := ps.subscribers[topic]; !ok {
-		ps.subscribers[topic] = make(map[string]*Subscriber)
-		newTopicMapCreated = true
+		ps.subscribers[topic] = make(map[string]*Subscriber[T])
 	}
 
 	if _, exists := ps.subscribers[topic][subscriberID]; exists {
-		logDebug("Error: Subscriber '%s' already exists for topic '%s'. Returning nil.", subscriberID, topic)
 		return nil
 	}
 
-	sub := &Subscriber{
+	sub := &Subscriber[T]{
 		ID:         subscriberID,
 		Topic:      topic,
-		Ch:         make(chan Message),
-		internalCh: make(chan Message, bufferSize),
+		Ch:         make(chan Message[T]),
+		internalCh: make(chan Message[T], bufferSize),
 		close:      make(chan struct{}),
 	}
 
 	sub.unsubscribeFunc = func() {
-		logDebug("Subscriber %s (topic '%s') initiated self-unsubscription via unsubscribeFunc.", sub.ID, sub.Topic)
-		ps.CleanupSub(sub)
+		ps.cleanupSub(sub)
 	}
 
 	ps.subscribers[topic][subscriberID] = sub
 	sub.deliveryWg.Add(1)
 	go sub.deliverMessages()
 
-	if newTopicMapCreated {
-		logDebug("Created new topic map for '%s'.", topic)
-	}
-	logDebug("Subscriber '%s' subscribed to topic '%s' with buffer size %d.", subscriberID, topic, bufferSize)
 	return sub
 }
 
-// Unsubscribe signals the PubSub system to remove and clean up this subscriber instance.
-// The call blocks until the subscriber's cleanup is complete. It is safe to call multiple times.
-func (s *Subscriber) Unsubscribe() {
-	if s.unsubscribed.CompareAndSwap(false, true) {
-		if s.unsubscribeFunc != nil {
-			logDebug("Subscriber %s (topic '%s'): Calling unsubscribeFunc.", s.ID, s.Topic)
-			s.unsubscribeFunc()
-		} else {
-			logDebug("Subscriber %s (topic '%s'): Unsubscribe called but unsubscribeFunc is nil.", s.ID, s.Topic)
-		}
-	} else {
-		logDebug("Subscriber %s (topic '%s'): Unsubscribe called but already in process or completed.", s.ID, s.Topic)
-	}
-}
-
-// Cleanup makes Subscriber implement the Cleanable interface. If a message containing
-// a subscriber as its Data is dropped, this method will be called, triggering the
-// subscriber's unsubscription process.
-func (s *Subscriber) Cleanup() {
-	logDebug("Cleanup() called for subscriber %s, calling Unsubscribe().", s.ID)
-	s.Unsubscribe()
-}
-
-// deliverMessages is an internal goroutine run for each subscriber.
-func (s *Subscriber) deliverMessages() {
+func (s *Subscriber[T]) deliverMessages() {
 	defer s.deliveryWg.Done()
-	defer func() {
-		close(s.Ch)
-		logDebug("Subscriber %s (topic '%s') public channel s.Ch closed.", s.ID, s.Topic)
-	}()
+	defer close(s.Ch)
 
-	logDebug("Subscriber %s (topic '%s') delivery goroutine started.", s.ID, s.Topic)
 	for {
 		select {
 		case msg, ok := <-s.internalCh:
 			if !ok {
-				logDebug("Subscriber %s (topic '%s') delivery: internalCh closed. Exiting.", s.ID, s.Topic)
 				return
 			}
 			select {
 			case s.Ch <- msg:
-				// Message successfully delivered to public channel
 			case <-s.close:
-				logDebug("Subscriber %s (topic '%s') delivery: s.close signal received while sending to s.Ch. Message dropped: %v", s.ID, s.Topic, msg.Data)
-				cleanupMessageData(msg.Data)
+				cleanupOrDrop(msg.Data)
 			}
 		case <-s.close:
-			logDebug("Subscriber %s (topic '%s') delivery: s.close signal received. Initiating internalCh closure.", s.ID, s.Topic)
-			s.internalCloseOnce.Do(func() {
-				close(s.internalCh)
-			})
-			// After closing internalCh, drain any remaining buffered messages.
+			s.internalCloseOnce.Do(func() { close(s.internalCh) })
 			for msg := range s.internalCh {
-				logDebug("Subscriber %s (topic '%s') delivery: Draining message from internalCh on shutdown: %v", s.ID, s.Topic, msg.Data)
-				cleanupMessageData(msg.Data)
+				cleanupOrDrop(msg.Data)
 			}
 		}
 	}
 }
 
-// CleanupSub performs the actual unsubscription and cleanup of a subscriber. It is intended
-// for internal use and is called by Subscriber.Unsubscribe() or PubSub.Close().
-func (ps *PubSub) CleanupSub(sub *Subscriber) {
+func (ps *basePubSub[T]) cleanupSub(sub *Subscriber[T]) {
 	if sub == nil {
-		logDebug("CleanupSub called with nil subscriber.")
 		return
 	}
-
-	originalSubID := sub.ID
-	originalSubTopic := sub.Topic
-	instanceActuallyRemovedFromMap := false
-
 	func() {
 		ps.mu.Lock()
 		defer ps.mu.Unlock()
-		topicSubscribers, topicExists := ps.subscribers[originalSubTopic]
-		if !topicExists {
-			return
-		}
-		existingSubInMap, subExistsInMap := topicSubscribers[originalSubID]
-		if !subExistsInMap {
-			return
-		}
-		if existingSubInMap == sub {
-			delete(topicSubscribers, originalSubID)
-			if len(topicSubscribers) == 0 {
-				delete(ps.subscribers, originalSubTopic)
+		if topicSubs, ok := ps.subscribers[sub.Topic]; ok {
+			if existingSub, found := topicSubs[sub.ID]; found && existingSub == sub {
+				delete(topicSubs, sub.ID)
+				if len(topicSubs) == 0 {
+					delete(ps.subscribers, sub.Topic)
+				}
 			}
-			instanceActuallyRemovedFromMap = true
 		}
 	}()
-
-	logDebug("CleanupSub: Initiating shutdown signal for subscriber '%s'. Instance removed: %t", sub.ID, instanceActuallyRemovedFromMap)
-	sub.shutdownOnce.Do(func() {
-		close(sub.close)
-		logDebug("CleanupSub: Signaled close for subscriber '%s'.", sub.ID)
-	})
-
-	go func(s *Subscriber) {
-		logDebug("Subscriber '%s' - starting drainer for public channel s.Ch.", s.ID)
-		for msg := range s.Ch {
-			cleanupMessageData(msg.Data) // Cleanup any messages drained from public channel
-		}
-		logDebug("Subscriber '%s' - finished draining public channel s.Ch.", s.ID)
-	}(sub)
-
-	// Wait for the deliverMessages goroutine to finish its shutdown sequence.
+	sub.shutdownOnce.Do(func() { close(sub.close) })
 	sub.deliveryWg.Wait()
-
-	// After the deliverMessages goroutine has stopped, we can safely drain any
-	// remaining messages from internalCh. This handles the race condition where
-	// deliverMessages might not have had time to drain everything.
-	sub.internalCloseOnce.Do(func() {
-		close(sub.internalCh)
-	})
-	for msg := range sub.internalCh {
-		logDebug("CleanupSub: Draining message from internalCh: %v", msg.Data)
-		cleanupMessageData(msg.Data)
-	}
-
-	logDebug("Subscriber '%s' cleanup complete.", originalSubID)
-}
-
-// SendReceive subscribes, publishes, and waits for a response. It returns the data from the
-// received message or nil if timed out or an error occurred.
-func (ps *PubSub) SendReceive(sendTopic string, receiveTopic string, sendMsg interface{}, timeoutMs int) (result interface{}) {
-	subID := ps.GetUniqueSubscriberID()
-	sub := ps.Subscribe(receiveTopic, subID, 1)
-	if sub == nil {
-		logDebug("SendReceive: Failed to subscribe to receive topic '%s'.", receiveTopic)
-		return nil
-	}
-	defer sub.Unsubscribe()
-
-	ps.Publish(Message{Topic: sendTopic, Data: sendMsg})
-
-	select {
-	case msg, ok := <-sub.Ch:
-		if ok {
-			result = msg.Data
-		} else {
-			logDebug("SendReceive: Subscriber channel closed before message received.", receiveTopic)
+	go func() {
+		for msg := range sub.Ch {
+			cleanupOrDrop(msg.Data)
 		}
-	case <-time.After(time.Millisecond * time.Duration(timeoutMs)):
-		logDebug("SendReceive timeout of %dms reached for receive topic '%s'.", timeoutMs, receiveTopic)
-	}
-	return
+	}()
 }
 
-// cleanupMessageData checks if data implements Cleanable and calls Cleanup if so.
-func cleanupMessageData(data interface{}) {
-	if cleanable, ok := data.(Cleanable); ok {
-		logDebug("Message data implements Cleanable, calling Cleanup().")
-		cleanable.Cleanup()
-	}
-}
-
-// Publish sends a message to all relevant subscribers of the message's topic.
-// Delivery behavior (dropping vs. blocking) depends on the topic's configuration.
-func (ps *PubSub) Publish(message Message) {
+func (ps *basePubSub[T]) publish(message Message[T]) {
 	topicConfig := ps.getTopicConfig(message.Topic)
-
 	ps.mu.RLock()
-	var subsToNotify []*Subscriber
+	var subsToNotify []*Subscriber[T]
 	if topicSubs, ok := ps.subscribers[message.Topic]; ok {
-		subsToNotify = make([]*Subscriber, 0, len(topicSubs))
+		subsToNotify = make([]*Subscriber[T], 0, len(topicSubs))
 		for _, sub := range topicSubs {
 			subsToNotify = append(subsToNotify, sub)
 		}
 	}
 	ps.mu.RUnlock()
 
-	if len(subsToNotify) == 0 {
-		logDebug("No subscribers for topic '%s'. Cleaning up message.", message.Topic)
-		cleanupMessageData(message.Data) // No subscribers, message is effectively dropped.
+	numSubs := len(subsToNotify)
+	if numSubs == 0 {
+		cleanupOrDrop(message.Data)
 		return
 	}
 
-	logDebug("Publishing message to topic '%s' to %d subscribers.", message.Topic, len(subsToNotify))
+	refs := make([]T, numSubs)
+	refs[0] = message.Data
+	if managed, ok := any(message.Data).(ManagedItem[T]); ok {
+		for i := 1; i < numSubs; i++ {
+			refs[i] = managed.Ref()
+		}
+	} else {
+		for i := 1; i < numSubs; i++ {
+			refs[i] = message.Data
+		}
+	}
 
 	var wg sync.WaitGroup
-	for _, currentSub := range subsToNotify {
+	for i, currentSub := range subsToNotify {
 		wg.Add(1)
-		go func(sub *Subscriber, m Message, tc TopicConfig) {
+		go func(sub *Subscriber[T], dataRef T, msgTopic string, tc TopicConfig) {
 			defer wg.Done()
-
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						logDebug("PANIC recovered in Publish send logic for sub %s: %v. Cleaning up message.", sub.ID, r)
-						cleanupMessageData(m.Data)
-					}
-				}()
-
-				select {
-				case <-sub.close:
-					logDebug("Warning: Not sending to subscriber '%s' as it's closing. Cleaning up message.", sub.ID)
-					cleanupMessageData(m.Data)
-					return
-				default:
+			sent := false
+			defer func() {
+				if r := recover(); r != nil {
+					logDebug("PANIC recovered in Publish send logic: %v", r)
 				}
-
-				if tc.AllowDropping {
-					select {
-					case sub.internalCh <- m:
-					default:
-						logDebug("Warning: Dropping message for subscriber '%s' (channel full, dropping allowed). Cleaning up message.", sub.ID)
-						cleanupMessageData(m.Data)
-					}
-				} else { // Blocking send
-					var C_timeoutChan <-chan time.Time
-					var timer *time.Timer
-					if tc.PublishTimeout > 0 {
-						timer = time.NewTimer(tc.PublishTimeout)
-						C_timeoutChan = timer.C
-						defer timer.Stop()
-					}
-					select {
-					case <-sub.close:
-						logDebug("Publish/Block: Subscriber '%s' closed. Cleaning up message.", sub.ID)
-						cleanupMessageData(m.Data)
-					case <-C_timeoutChan:
-						logDebug("Publish/Block: Timeout for subscriber '%s'. Cleaning up message.", sub.ID)
-						cleanupMessageData(m.Data)
-					case sub.internalCh <- m:
-					}
+				if !sent {
+					cleanupOrDrop(dataRef)
 				}
 			}()
-		}(currentSub, message, topicConfig)
+
+			select {
+			case <-sub.close:
+				return
+			default:
+			}
+			msgToSend := Message[T]{Topic: msgTopic, Data: dataRef}
+			if tc.AllowDropping {
+				select {
+				case sub.internalCh <- msgToSend:
+					sent = true
+				default:
+				}
+			} else {
+				var timeoutChan <-chan time.Time
+				if tc.PublishTimeout > 0 {
+					timer := time.NewTimer(tc.PublishTimeout)
+					defer timer.Stop()
+					timeoutChan = timer.C
+				}
+				select {
+				case <-sub.close:
+				case <-timeoutChan:
+				case sub.internalCh <- msgToSend:
+					sent = true
+				}
+			}
+		}(currentSub, refs[i], message.Topic, topicConfig)
 	}
 	wg.Wait()
 }
 
-// Close gracefully shuts down the PubSub system. It unsubscribes all active subscribers
-// and ensures their resources are released.
-func (ps *PubSub) Close() {
-	logDebug("Initiating graceful shutdown of PubSub system.")
-
-	allSubscribers := func() []*Subscriber {
+func (ps *basePubSub[T]) close() {
+	allSubscribers := func() []*Subscriber[T] {
 		ps.mu.Lock()
 		defer ps.mu.Unlock()
-
-		subs := make([]*Subscriber, 0)
+		subs := make([]*Subscriber[T], 0)
 		if ps.subscribers != nil {
 			for _, topicSubs := range ps.subscribers {
 				for _, sub := range topicSubs {
 					subs = append(subs, sub)
 				}
 			}
-			ps.subscribers = make(map[string]map[string]*Subscriber)
+			ps.subscribers = make(map[string]map[string]*Subscriber[T])
 			ps.topicConfigs = make(map[string]TopicConfig)
-			logDebug("PubSub subscribers and topicConfigs maps cleared.")
 		}
 		return subs
 	}()
-
 	var wg sync.WaitGroup
-	logDebug("PubSub.Close: Cleaning up %d subscribers.", len(allSubscribers))
 	for _, subInstance := range allSubscribers {
 		wg.Add(1)
-		go func(s *Subscriber) {
+		go func(s *Subscriber[T]) {
 			defer wg.Done()
-			logDebug("PubSub.Close: Triggering Unsubscribe for subscriber '%s'.", s.ID)
 			s.Unsubscribe()
-			logDebug("PubSub.Close: Unsubscribe call completed for subscriber '%s'.", s.ID)
 		}(subInstance)
 	}
 	wg.Wait()
-	logDebug("PubSub system closed gracefully.")
 }
 
-// ReadMessages is a helper function for clients to continuously read messages
-// from a subscriber's channel using a provided handler function. This function will
-// block until the subscriber's channel is closed.
-func (s *Subscriber) ReadMessages(handler func(Message)) {
-	logDebug("Subscriber %s (topic '%s') ReadMessages loop started.", s.ID, s.Topic)
-	for msg := range s.Ch {
-		logDebug("Subscriber %s (topic '%s') ReadMessages calling handler.", s.ID, s.Topic)
-		handler(msg)
+func cleanupOrDrop[T any](data T) {
+	if managed, ok := any(data).(ManagedItem[T]); ok {
+		managed.Cleanup()
 	}
-	logDebug("Subscriber %s (topic '%s') ReadMessages loop exited (s.Ch closed).", s.ID, s.Topic)
+}
+
+// ------------------- Public Type-Safe PubSub API -------------------
+
+// PubSub provides a type-safe, multi-topic publish-subscribe system.
+// It manages topic-to-type registration and ensures that publish and subscribe
+// operations are type-checked.
+type PubSub struct {
+	topicSystems map[string]pubSubCore
+	mu           sync.RWMutex
+}
+
+// NewPubSub creates a new type-safe pub/sub system. This is the main entry
+// point for creating a new pub/sub instance.
+func NewPubSub() *PubSub {
+	return &PubSub{
+		topicSystems: make(map[string]pubSubCore),
+	}
+}
+
+// RegisterTopic associates a topic string with a specific data type. You must
+// register a topic's type before publishing or subscribing to it. An optional
+// TopicConfig can be provided to set behaviors like message dropping or timeouts.
+func RegisterTopic[T any](ps *PubSub, topic string, config ...TopicConfig) error {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	var typedSystem *basePubSub[T]
+
+	if system, ok := ps.topicSystems[topic]; ok {
+		// Topic exists, check if types match
+		var okCast bool
+		typedSystem, okCast = system.(*basePubSub[T])
+		if !okCast {
+			var zero T
+			return fmt.Errorf("topic '%s' is already registered with a different type than %T", topic, zero)
+		}
+	} else {
+		// Topic does not exist, create it
+		typedSystem = newBasePubSub[T]()
+		ps.topicSystems[topic] = typedSystem
+		logDebug("Registered topic '%s' with type %T", topic, *new(T))
+	}
+
+	// Apply config if provided. This allows creating and configuring in one step.
+	if len(config) > 0 {
+		typedSystem.updateTopic(topic, config[0])
+	}
+
+	return nil
+}
+
+// UpdateTopic changes or sets the configuration for an already registered topic.
+// This is useful for changing behaviors like message dropping or timeouts at runtime.
+func (ps *PubSub) UpdateTopic(topic string, config TopicConfig) {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	if system, ok := ps.topicSystems[topic]; ok {
+		system.updateTopic(topic, config)
+	}
+}
+
+// Close gracefully shuts down the underlying PubSub system.
+func (ps *PubSub) Close() {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	for _, system := range ps.topicSystems {
+		system.close()
+	}
+	ps.topicSystems = make(map[string]pubSubCore) // Clear the map
+}
+
+// GetUniqueSubscriberID generates a new unique subscriber ID.
+func (ps *PubSub) GetUniqueSubscriberID() string {
+	// A single counter is sufficient for all internal pubsub systems.
+	return fmt.Sprintf("sub-%d", uniqueIDCounter.Add(1))
+}
+
+// Subscribe provides a type-safe way to subscribe to a topic. It returns a
+// strongly-typed Subscriber[T] if the topic has been registered with type T.
+func Subscribe[T any](ps *PubSub, topic string, subscriberID string, bufferSize int) (*Subscriber[T], error) {
+	ps.mu.RLock()
+	system, ok := ps.topicSystems[topic]
+	ps.mu.RUnlock()
+
+	if !ok {
+		return nil, fmt.Errorf("topic '%s' has not been registered", topic)
+	}
+
+	typedSystem, ok := system.(*basePubSub[T])
+	if !ok {
+		var zero T
+		return nil, fmt.Errorf("topic '%s' is registered with a different type than %T", topic, zero)
+	}
+
+	sub := typedSystem.subscribe(topic, subscriberID, bufferSize)
+	if sub == nil {
+		return nil, fmt.Errorf("subscriber ID '%s' already exists for topic '%s'", subscriberID, topic)
+	}
+	return sub, nil
+}
+
+// Publish provides a type-safe way to publish a message.
+// It ensures the message's type matches the registered type for the topic.
+func Publish[T any](ps *PubSub, message Message[T]) error {
+	ps.mu.RLock()
+	system, ok := ps.topicSystems[message.Topic]
+	ps.mu.RUnlock()
+
+	if !ok {
+		cleanupOrDrop(message.Data)
+		return fmt.Errorf("topic '%s' has not been registered", message.Topic)
+	}
+
+	typedSystem, ok := system.(*basePubSub[T])
+	if !ok {
+		cleanupOrDrop(message.Data)
+		var zero T
+		return fmt.Errorf("topic '%s' is registered with a different type than %T", message.Topic, zero)
+	}
+
+	typedSystem.publish(message)
+	return nil
+}
+
+// SendReceive provides a type-safe implementation of a request-response pattern.
+// It subscribes to a 'receiveTopic' expecting a response of type ResT, publishes a
+// request of type ReqT to a 'sendTopic', and waits for a response.
+// It returns the response and true if successful, or the zero value of ResT and false on timeout.
+// Note: Both the send and receive topics must be registered with their respective types beforehand.
+func SendReceive[ReqT, ResT any](
+	ps *PubSub,
+	sendTopic string,
+	receiveTopic string,
+	requestData ReqT,
+	timeoutMs int,
+) (ResT, bool) {
+	// Create a unique subscriber ID for the temporary response listener.
+	subID := ps.GetUniqueSubscriberID()
+
+	// Subscribe to the receive topic, expecting the response type.
+	sub, err := Subscribe[ResT](ps, receiveTopic, subID, 1)
+	if err != nil {
+		logDebug("SendReceive: Failed to subscribe to receive topic '%s': %v", receiveTopic, err)
+		var zero ResT
+		return zero, false
+	}
+	defer sub.Unsubscribe()
+
+	// Publish the request message.
+	err = Publish(ps, Message[ReqT]{Topic: sendTopic, Data: requestData})
+	if err != nil {
+		// If publishing fails (e.g., topic not registered), we won't get a response.
+		logDebug("SendReceive: Failed to publish to send topic '%s': %v", sendTopic, err)
+		var zero ResT
+		return zero, false
+	}
+
+	// Wait for the response or a timeout.
+	select {
+	case msg, ok := <-sub.Ch:
+		if ok {
+			// Successfully received a response.
+			return msg.Data, true
+		}
+		// Channel was closed before a message was received.
+		logDebug("SendReceive: Subscriber channel for topic '%s' closed before message received.", receiveTopic)
+		var zero ResT
+		return zero, false
+	case <-time.After(time.Millisecond * time.Duration(timeoutMs)):
+		logDebug("SendReceive timeout of %dms reached for receive topic '%s'.", timeoutMs, receiveTopic)
+		var zero ResT
+		return zero, false
+	}
 }

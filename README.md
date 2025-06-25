@@ -1,158 +1,150 @@
 # go-pubsubmutex
 
-Package pubsubmutex implements a thread-safe, in-memory, topic-based
-publish-subscribe system. It is designed for concurrent applications where
-different parts of the system need to communicate asynchronously without
-being directly coupled.
+Package pubsubmutex implements a thread-safe, in-memory, multi-topic publish-subscribe
+system that provides type safety for each topic.
+
+This package allows you to create a single pub/sub instance that can handle different
+data types on different topics. It ensures that you can only publish or subscribe
+to a topic with the data type it was registered with.
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/jonoton/go-pubsubmutex.svg)](https://pkg.go.dev/github.com/jonoton/go-pubsubmutex)
 [![Go Report Card](https://goreportcard.com/badge/github.com/jonoton/go-pubsubmutex?)](https://goreportcard.com/report/github.com/jonoton/go-pubsubmutex)
 
 ## Key Features
 
-  - **Thread Safety:** All operations on the PubSub system, such as subscribing,
-    publishing, and unsubscribing, are safe for concurrent use by multiple goroutines.
+  - **Type-Safe Topics:** Register each topic with a specific Go type. The generic
+    `Publish` and `Subscribe` functions then check this type at runtime, returning
+    an error if there is a mismatch.
 
-  - **Topic-Based Communication:** Clients subscribe to named topics and receive
-    only the messages published to those specific topics.
+  - **Centralized Management:** Use a single `PubSub` instance to manage multiple,
+    type-safe topic systems.
 
-  - **Configurable Message Delivery:** Topic behavior can be configured using
-    TopicConfig. This allows control over whether messages should be dropped if a
-    subscriber's buffer is full (AllowDropping) or if publishing should block
-    with a specific timeout (PublishTimeout).
+  - **Thread Safety:** All operations are safe for concurrent use by multiple goroutines.
 
-  - **Decoupled Architecture:** Each subscriber has an internal buffered channel that
-    decouples the publisher from the consumer. A publisher can send a message
-    without waiting for the subscriber to be ready to process it, improving system
-    responsiveness.
+  - **Reference Counting & Cleanup:** Message data can implement the `ManagedItem[T]`
+    interface. The system will automatically call `Ref()` when creating new references
+    for subscribers and `Cleanup()` when a message reference is dropped, preventing
+    resource leaks.
 
-  - **Subscriber Self-Cleanup:** Subscribers can manage their own lifecycle. A client
-    holding a Subscriber instance can call its Unsubscribe() method to cleanly
-    remove itself from the PubSub system.
+  - **Configurable Delivery:** Configure topics to either drop messages or block with a
+    timeout if a subscriber's buffer is full. This can be done at registration
+    time or later via `UpdateTopic`.
 
-  - **Automatic Resource Cleanup:** If a message's `Data` field implements the `Cleanable`
-    interface (with a `Cleanup()` method), `Cleanup()` will be called automatically
-    if the message is dropped. This occurs if a subscriber's buffer is full, a
-    publish times out, the subscriber is closing, or if there are no subscribers
-    for the topic at all. This prevents resource leaks.
-
-  - **Graceful Shutdown:** The entire PubSub system can be shut down gracefully
-    using the Close() method, which ensures all active subscribers are unsubscribed
-    and their resources are released.
+  - **Subscriber Self-Cleanup:** Subscriber instances can unsubscribe themselves via
+    the `Unsubscribe()` method.
 
 ## Usage Examples
 
-Here are some examples demonstrating how to use the package.
+Here are some examples demonstrating how to use the type-safe API.
 
-### Initialization and Subscribing
+### Initialization and Topic Registration
 
-First, create a new PubSub system instance and subscribe to a topic. The `Subscribe`
-method returns a `Subscriber` instance, which contains the channel you will use
-to receive messages.
+First, create a `PubSub` instance. Before you can use a topic, you must register it
+with the specific data type it will carry. You can optionally provide a configuration
+at the same time.
 
 ```go
 // Create a new PubSub system.
 ps := pubsubmutex.NewPubSub()
 defer ps.Close() // Best practice to defer Close().
 
-// Subscribe to a topic with a unique subscriber ID and a buffer size of 10.
-sub1 := ps.Subscribe("news.sports", "subscriber-1", 10)
-if sub1 == nil {
-	fmt.Println("Failed to subscribe")
-	return
+// Define the types for your topics.
+type UserUpdate struct{ UserID int; NewEmail string }
+type OrderEvent struct{ OrderID string; Status string }
+
+// Register a topic with default settings.
+pubsubmutex.RegisterTopic[UserUpdate](ps, "user.updates")
+
+// Register another topic and configure it to drop messages if buffers are full.
+pubsubmutex.RegisterTopic[OrderEvent](ps, "order.events", pubsubmutex.TopicConfig{AllowDropping: true})
+```
+
+### Type-Safe Subscribing and Publishing
+
+Once a topic is registered, you can use the generic `Subscribe` and `Publish`
+functions. They will return an error at runtime if you use the wrong type.
+
+```go
+// Assumes 'ps' is created and topics are registered from the previous example.
+var wg sync.WaitGroup
+
+// Subscribe to the "user.updates" topic, getting a type-safe subscriber.
+userSub, err := pubsubmutex.Subscribe[UserUpdate](ps, "user.updates", "user-service", 10)
+if err != nil {
+  // Handle error
 }
 
-fmt.Printf("Successfully subscribed '%s' to topic '%s'.\n", sub1.ID, sub1.Topic)
-```
-
-### Publishing and Receiving Messages
-
-Publish messages to a topic using `ps.Publish()`. To receive them, read from the
-`Ch` channel on your `Subscriber` instance. It's common to do this in a separate goroutine.
-
-```go
-// Assumes 'ps' and 'sub1' exist from the previous example.
-var wg sync.WaitGroup
-wg.Add(1)
-go func() {
-	defer wg.Done()
-	fmt.Println("Subscriber 1 waiting for messages...")
-	for msg := range sub1.Ch {
-		fmt.Printf("Subscriber 1 received: Topic='%s', Data='%v'\n", msg.Topic, msg.Data)
-	}
-	// The loop will exit when sub1.Ch is closed (e.g., by unsubscribing).
-	fmt.Println("Subscriber 1 message channel closed.")
-}()
-
-// Publish messages to the topic.
-ps.Publish(pubsubmutex.Message{Topic: "news.sports", Data: "Welcome to sports news!"})
-ps.Publish(pubsubmutex.Message{Topic: "news.weather", Data: "This message will not be received by sub1."})
-ps.Publish(pubsubmutex.Message{Topic: "news.sports", Data: "A great match happened today."})
-```
-
-### Self-Unsubscribing
-
-A subscriber can clean itself up by calling its `Unsubscribe()` method. This is often
-done based on some condition, like receiving a specific message.
-
-```go
-ps := pubsubmutex.NewPubSub()
-defer ps.Close()
-
-var wg sync.WaitGroup
-sub := ps.Subscribe("commands", "worker-1", 5)
+// This call will fail at runtime and return an error because the topic
+// "user.updates" is registered for UserUpdate, not OrderEvent.
+orderSub, err := pubsubmutex.Subscribe[OrderEvent](ps, "user.updates", "order-service", 10)
+if err != nil {
+  fmt.Println("Correctly caught type mismatch error:", err)
+}
 
 wg.Add(1)
 go func() {
-	defer wg.Done()
-	for msg := range sub.Ch {
-		fmt.Printf("Worker received command: %v\n", msg.Data)
-		if msg.Data == "stop" {
-			fmt.Println("Stop command received. Unsubscribing...")
-			sub.Unsubscribe() // Subscriber triggers its own cleanup.
-		}
-	}
-	fmt.Println("Worker message loop exited.")
+  defer wg.Done()
+  for msg := range userSub.Ch { // msg is of type pubsubmutex.Message[UserUpdate]
+    fmt.Printf("User update received: ID=%d, NewEmail=%s\n", msg.Data.UserID, msg.Data.NewEmail)
+  }
 }()
 
-ps.Publish(pubsubmutex.Message{Topic: "commands", Data: "start processing"})
-ps.Publish(pubsubmutex.Message{Topic: "commands", Data: "stop"})
+// Publishing is also checked at runtime.
+updateMsg := pubsubmutex.Message[UserUpdate]{
+  Topic: "user.updates",
+  Data:  UserUpdate{UserID: 123, NewEmail: "new.email@example.com"},
+}
+err = pubsubmutex.Publish(ps, updateMsg)
+if err != nil {
+  // Handle error
+}
 
-wg.Wait() // Wait for the worker goroutine to finish.
+// This publish will fail at runtime and return an error.
+errorMsg := pubsubmutex.Message[OrderEvent]{
+  Topic: "user.updates",
+  Data:  OrderEvent{OrderID: "xyz"},
+}
+err = pubsubmutex.Publish(ps, errorMsg)
+if err != nil {
+  fmt.Println("Correctly caught publish type mismatch error:", err)
+}
 ```
 
-### Automatic Cleanup of Dropped Messages
+### Using ManagedItem for Resource Cleanup
 
-If a message's payload needs to have resources freed (e.g., closing a file handle),
-you can implement the `Cleanable` interface. Its `Cleanup()` method will be called
-if the message is dropped.
+If your message data holds a resource (like a file handle or pointer), you can
+implement the `ManagedItem[T]` interface to manage its lifecycle.
 
 ```go
-// Define a type that holds a resource.
+// Define a type that holds a resource and a reference count.
 type ResourcefulMessage struct {
-	ID       int
-	resource string // In a real scenario, this might be a file handle, etc.
+  ID       int
+  refCount int32
 }
 
-// Implement the Cleanable interface.
+// Implement the ManagedItem interface.
+func (rm *ResourcefulMessage) Ref() *ResourcefulMessage {
+  atomic.AddInt32(&rm.refCount, 1)
+  return rm
+}
+
 func (rm *ResourcefulMessage) Cleanup() {
-	fmt.Printf("Cleaning up resource for message ID: %d\n", rm.ID)
-	// Here you would close the file handle, network connection, etc.
+  if atomic.AddInt32(&rm.refCount, -1) == 0 {
+    fmt.Printf("Final cleanup for resource ID: %d\n", rm.ID)
+    // Here you would close the file handle, etc.
+  }
 }
 
-// ... later in the code ...
+// ... later in your code ...
+topic := "resource.topic"
+pubsubmutex.RegisterTopic[*ResourcefulMessage](ps, topic)
 
-// This topic is configured to drop messages immediately if the buffer is full.
-ps.CreateTopic("resource.topic", pubsubmutex.TopicConfig{AllowDropping: true})
-
-// Subscriber with a small buffer that is not reading messages, causing it to fill up.
-sub := ps.Subscribe("resource.topic", "resource-worker", 1)
-
-// Publish two messages. The first will fill the buffer. The second will be dropped.
-// The Cleanup() method for the second message will be called automatically.
-ps.Publish(pubsubmutex.Message{Topic: "resource.topic", Data: &ResourcefulMessage{ID: 1, resource: "active"}})
-ps.Publish(pubsubmutex.Message{Topic: "resource.topic", Data: &ResourcefulMessage{ID: 2, resource: "active"}})
-
-// Output will include:
-// Cleaning up resource for message ID: 2
+// Publish to a topic with no subscribers. The message will be dropped,
+// and its Cleanup() method will be called automatically.
+resourceMsg := pubsubmutex.Message[*ResourcefulMessage]{
+  Topic: topic,
+  Data:  &ResourcefulMessage{ID: 1, refCount: 1},
+}
+pubsubmutex.Publish(ps, resourceMsg)
+// Output will include: Final cleanup for resource ID: 1
 ```
